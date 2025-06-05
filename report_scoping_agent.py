@@ -100,7 +100,7 @@ class ReportScopingAgent:
                 logger.error(f"Failed to fetch existing agent by name after creation attempt failed: {fetch_e}")
                 raise e # Re-raise original creation exception
 
-        azure_ai_agent_instance = AzureAIAgent(definition=agent_definition, project_client=client)
+        azure_ai_agent_instance = AzureAIAgent(client=client, definition=agent_definition)
         return cls(azure_ai_agent=azure_ai_agent_instance, agent_definition=agent_definition, client=client)
 
     async def scope_topic(self, initial_topic: str, clarification_response: Optional[str] = None) -> str:
@@ -127,26 +127,47 @@ class ReportScopingAgent:
         user_message = "\n".join(message_parts)
 
         try:
-            # For simplicity, creating a new thread for each interaction to avoid complex state management.
-            # If conversational history is important across scope_topic calls, manage self.thread_id.
-            thread_obj = await self.client.threads.create_thread()
-            if not thread_obj or not thread_obj.id:
-                logger.error("Failed to create thread: No ID returned from service.")
-                return "Error: Could not process the topic due to an Azure AI infrastructure error (thread creation failed)."
-            thread_id = thread_obj.id
-            logger.info(f"Successfully created thread with ID: {thread_id}")
+            logger.debug(f"Invoking AzureAIAgent with thread_id: {self.thread_id} for user message: {user_message}")
 
-            logger.debug(f"Sending message to AzureAIAgent (Thread ID: {thread_id}):\n{user_message}")
-            
-            response_item = await self.azure_agent.get_response(
-                messages=[ChatMessageContent(role="user", content=user_message)],
-                thread=thread_obj  # Pass the thread object, not just the ID
+            # Invoke the agent. AzureAIAgent handles thread creation/management if self.thread_id is None,
+            # or uses the existing thread if self.thread_id is provided.
+            response_messages = await self.azure_agent.invoke(
+                input=user_message,  # Pass the user_message string as input
+                thread_id=self.thread_id
             )
-            result_str = str(response_item.message.content).strip()
-            logger.debug(f"Received response from AzureAIAgent:\n{result_str}")
 
-            # Clean up the thread after getting the response for this single turn
-            await thread_obj.delete()
+            if not response_messages:
+                logger.error("Received no response from AzureAIAgent.")
+                return "Error: No response from agent."
+
+            # Semantic Kernel typically returns a list of ChatMessageContent objects.
+            # The primary response is usually the first message from the assistant.
+            agent_response_message = response_messages[0]
+
+            # Update thread_id from the response for continuity in subsequent calls
+            if agent_response_message.thread_id:
+                self.thread_id = agent_response_message.thread_id
+            
+            # Extract the actual text content from the agent's response message
+            # The structure of ChatMessageContent's 'content' can vary.
+            # It might be a string, or a list of content parts (e.g., TextContentPart).
+            if isinstance(agent_response_message.content, str):
+                result_str = agent_response_message.content.strip()
+            elif isinstance(agent_response_message.content, list) and len(agent_response_message.content) > 0:
+                # Assuming the first part of the content list is the desired text.
+                # This could be a TextContentPart or similar.
+                first_content_part = agent_response_message.content[0]
+                if hasattr(first_content_part, 'text'): # Common for TextContentPart
+                    result_str = str(first_content_part.text).strip()
+                elif hasattr(first_content_part, 'content'): # For some nested structures
+                    result_str = str(first_content_part.content).strip()
+                else: # Fallback if it's another type of content part
+                    result_str = str(first_content_part).strip()
+            else:
+                logger.warning(f"Could not extract standard text from agent response content: {agent_response_message.content}")
+                result_str = str(agent_response_message.content).strip() # Fallback to stringifying the content
+
+            logger.debug(f"Received response from AzureAIAgent (Thread ID: {self.thread_id}):\n{result_str}")
             self.thread_id = None
 
         except Exception as e:
