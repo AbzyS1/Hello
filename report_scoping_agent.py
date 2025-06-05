@@ -46,16 +46,18 @@ class ReportScopingAgent:
     Do not add any preamble or explanation before or after the JSON or question.
     """
 
-    def __init__(self, azure_ai_agent: AzureAIAgent, agent_definition: AzureAIAgentModel):
+    def __init__(self, azure_ai_agent: AzureAIAgent, agent_definition: AzureAIAgentModel, client: AIProjectClient):
         """
         Initializes the ReportScopingAgent.
 
         Args:
             azure_ai_agent: An initialized AzureAIAgent instance.
             agent_definition: The definition of the agent as created in Azure AI Foundry.
+            client: The AIProjectClient for interacting with Azure AI services.
         """
         self.azure_agent = azure_ai_agent
         self.agent_definition = agent_definition
+        self.client = client  # Store the AIProjectClient instance
         self.thread_id: Optional[str] = None # To maintain conversation context if needed
 
     @classmethod
@@ -98,8 +100,8 @@ class ReportScopingAgent:
                 logger.error(f"Failed to fetch existing agent by name after creation attempt failed: {fetch_e}")
                 raise e # Re-raise original creation exception
 
-        azure_ai_agent_instance = AzureAIAgent(client=client, definition=agent_definition)
-        return cls(azure_ai_agent=azure_ai_agent_instance, agent_definition=agent_definition)
+        azure_ai_agent_instance = AzureAIAgent(definition=agent_definition, project_client=client)
+        return cls(azure_ai_agent=azure_ai_agent_instance, agent_definition=agent_definition, client=client)
 
     async def scope_topic(self, initial_topic: str, clarification_response: Optional[str] = None) -> str:
         """
