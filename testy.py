@@ -1,4 +1,3 @@
-# Import required libraries
 import os
 import json
 from dotenv import load_dotenv
@@ -8,7 +7,8 @@ from azure.core.credentials import AzureKeyCredential
 from azure.ai.projects import AIProjectClient
 from azure.ai.projects.models import AzureAISearchTool, ConnectionType
 from azure.search.documents import SearchClient
-from azure.ai.inference.models import UserMessage
+# The response message content objects are part of the inference models
+from azure.ai.inference.models import UserMessage, MessageText, MessageTextContent
 
 def initialize_clients():
     """Initializes and returns the AIProjectClient."""
@@ -22,7 +22,6 @@ def initialize_clients():
         project_client = AIProjectClient.from_connection_string(
             conn_str=os.getenv("PROJECT_CONNECTION_STRING"),
             credential=credential
-            # api_version="2024-12-01-preview" # Optional: Uncomment if a specific API version is needed
         )
         print("✓ Successfully initialized AIProjectClient")
         return project_client
@@ -47,9 +46,9 @@ def perform_simple_completion(project_client, model_deployment_name="gpt-4o-3"):
         print(f"An error occurred during simple chat completion: {str(e)}")
 
 def setup_search_tool(project_client, search_index_name="fin-apd-ifrs-index"):
-    """Sets up and returns the Azure AI Search tool and SearchClient."""
+    """Sets up and returns the Azure AI Search tool."""
     if not project_client:
-        return None, None
+        return None
 
     try:
         search_conn = project_client.connections.get_default(
@@ -59,54 +58,59 @@ def setup_search_tool(project_client, search_index_name="fin-apd-ifrs-index"):
 
         if not search_conn:
             print("× No default Azure AI Search Connection found in project.")
-            return None, None
+            return None
 
-        s_endpoint = search_conn.endpoint_url
-        s_credential = AzureKeyCredential(search_conn.key)
-
-        search_client = SearchClient(
-            endpoint=s_endpoint,
-            index_name=search_index_name,
-            credential=s_credential
-        )
-        print("✓ Successfully initialized SearchClient")
-
-        # Optional: Perform a test search
-        # results = search_client.search(search_text="cash flow", filter=None, top=1)
-        # print(f"✓ Test search successful. Found {results.get_count()} documents for 'cash flow'.")
-
+        # The AzureAISearchTool helper class correctly sets up the tool for citation generation.
+        # No complex field_mapping is needed here; the platform handles it by default.
         ai_search_tool = AzureAISearchTool(
             index_connection_id=search_conn.id,
-            index_name=search_index_name
+            index_name=search_index_name,
+            # You can still configure top_k or query_type if needed
+            top_k=5 
         )
-        print("✓ Successfully configured AzureAISearchTool")
-        return ai_search_tool, search_client
+        print(f"✓ Successfully configured AzureAISearchTool for index '{search_index_name}'")
+        return ai_search_tool
     except Exception as e:
         print(f"× Error setting up search tool: {str(e)}")
-        return None, None
+        return None
 
 def create_agent_with_tool(project_client, model_deployment_name, ai_search_tool):
-    """Creates an agent with the provided search tool."""
+    """Creates an agent with the provided search tool and instructions to generate citations."""
     if not project_client or not ai_search_tool:
         return None
    
     try:
+        # --- KEY CHANGE: Updated instructions ---
+        # Explicitly instruct the agent to use the tool and cite its sources.
+        # This is crucial for triggering the annotation generation.
+        instructions = (
+            "You are an expert accounting policy assistant. "
+            "You must answer questions using only the information available in the search tool. "
+            "You MUST cite your sources. For each piece of information you provide, "
+            "include a citation reference in your response. The citations will be "
+            "automatically generated from the documents you use."
+        )
+
         agent = project_client.agents.create_agent(
             model=model_deployment_name,
-            name="IFRS-Search-Agent",
-            instructions="You are an accounting policy expert. You provide the most helpful information only.",
+            name="IFRS-Search-Agent-Citations", # Using a new name to avoid conflicts
+            instructions=instructions,
             tools=ai_search_tool.definitions,
             tool_resources=ai_search_tool.resources,
-            headers={"x-ms-enable-preview": "true"} # Required if the feature is in preview
+            headers={"x-ms-enable-preview": "true"}
         )
         print(f"✓ Agent '{agent.name}' created with ID: {agent.id}")
         return agent
     except Exception as e:
+        # If an agent with this name already exists, you might get an error.
+        # Consider adding logic to find and reuse an existing agent if needed.
         print(f"× Error creating agent: {str(e)}")
         return None
 
 def run_agent_query(project_client, agent, question: str):
-    """Runs a query against the specified agent."""
+    """
+    Runs a query and prints the raw, complete annotation objects for inspection.
+    """
     if not project_client or not agent:
         print("× Cannot run agent query: Client or agent not initialized.")
         return
@@ -116,15 +120,14 @@ def run_agent_query(project_client, agent, question: str):
         thread = project_client.agents.create_thread()
         print(f"\n📝 Created thread, ID: {thread.id} for question: '{question}'")
 
-        # Step 2: Add the user's question as a message in the thread
-        message = project_client.agents.create_message(
+        # Step 2: Add the user's question to the thread
+        project_client.agents.create_message(
             thread_id=thread.id,
             role="user",
             content=question
         )
-        print(f"💬 Created user message, ID: {message.id}")
 
-        # Step 3: Create and start an agent run
+        # Step 3: Create and process the run
         run = project_client.agents.create_and_process_run(
             thread_id=thread.id,
             agent_id=agent.id
@@ -133,23 +136,41 @@ def run_agent_query(project_client, agent, question: str):
 
         if run.last_error:
             print(f"⚠️ Run error: {run.last_error.message}")
-            return # Exit if there was an error during the run processing itself
+            return
 
-        # Step 4: Get the agent's response
+        # Step 4: Get the agent's response and inspect annotations
         msg_list = project_client.agents.list_messages(thread_id=thread.id, order_by="created_at desc")
        
         assistant_responded = False
-        for m in msg_list.data: # Iterate from newest to oldest
+        for m in msg_list.data:
             if m.role == "assistant" and m.content:
-                print("\nAssistant says:")
-                for c in m.content:
-                    if hasattr(c, "text") and c.text:
-                        print(c.text.value)
+                print("\n✅ Assistant Response:")
+                
+                for content_block in m.content:
+                    if hasattr(content_block, "text"):
+                        text_value = content_block.text.value
+                        annotations = content_block.text.annotations
+                        
+                        # Print the main text response from the assistant
+                        print(text_value)
+                        
+                        # --- KEY CHANGE: Inspect raw annotations ---
+                        if annotations:
+                            print("\n🔍 Raw Annotation Objects (for inspection):")
+                            for i, annotation in enumerate(annotations):
+                                print(f"--- Annotation [{i+1}] ---")
+                                # The annotation object has a 'model_dump' method to serialize it
+                                # to a dictionary, which we can then print as a clean JSON string.
+                                annotation_dict = annotation.model_dump()
+                                print(json.dumps(annotation_dict, indent=2))
+                        else:
+                            print("\n- No annotations provided for this response.")
+
                 assistant_responded = True
-                break
+                break # We found the latest assistant message, so we can stop
        
         if not assistant_responded:
-            print("   No response from assistant found in the thread.")
+            print("   - No response from assistant found in the thread.")
 
     except Exception as e:
         print(f"× An error occurred while running agent query for '{question}': {str(e)}")
@@ -157,36 +178,28 @@ def run_agent_query(project_client, agent, question: str):
 
 def main():
     """Main function to orchestrate the script's operations."""
-    # Load environment variables from .env file
     load_dotenv('.env')
-
-    # Initialize AIProjectClient
     project_client = initialize_clients()
     if not project_client:
-        return # Exit if client initialization fails
+        return
 
-    # Model deployment name
-    model_deployment_name = "gpt-4o-3" # Ensure this model is available in your project
-
-    # Perform a simple completion (optional, as in the original script)
+    model_deployment_name = "gpt-4o-3"
     perform_simple_completion(project_client, model_deployment_name)
 
-    # Setup Azure AI Search tool
-    s_index_name = "fin-apd-ifrs-index" # Your specific search index name
-    ai_search_tool, _ = setup_search_tool(project_client, s_index_name) # We don't need search_client in main flow after setup
+    s_index_name = "fin-apd-ifrs-index"
+    ai_search_tool = setup_search_tool(project_client, s_index_name)
    
     if not ai_search_tool:
         print("× Agent creation skipped due to search tool setup failure.")
         return
 
-    # Create the agent
+    # Create the agent with instructions for citations
     agent = create_agent_with_tool(project_client, model_deployment_name, ai_search_tool)
 
     if agent:
-        # Run agent queries
         print("\n--- Running Agent Queries ---")
-        run_agent_query(project_client, agent, "Purpose of IFRS17??")
-        run_agent_query(project_client, agent, "List of insurance contracts that IFRS17 applies??")
+        run_agent_query(project_client, agent, "What is the purpose of IFRS 17?")
+        run_agent_query(project_client, agent, "Which insurance contracts does IFRS 17 apply to?")
     else:
         print("× Skipping agent queries as agent creation failed.")
 
