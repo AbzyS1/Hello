@@ -107,17 +107,22 @@ def create_agent_with_tool(project_client, model_deployment_name, ai_search_tool
         print(f"× Error creating agent: {str(e)}")
         return None
 
+def sdk_object_serializer(o):
+    """A custom JSON serializer for SDK objects that are not directly serializable."""
+    if hasattr(o, '__dict__'):
+        return vars(o)
+    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
 def run_agent_query(project_client, agent, question: str):
     """
-    Runs a query and prints the raw, complete annotation objects for inspection by
-    manually converting them to dictionaries.
+    Runs a query and prints the raw annotation objects using a custom JSON serializer.
     """
     if not project_client or not agent:
         print("× Cannot run agent query: Client or agent not initialized.")
         return
 
     try:
-        # Step 1-3: Create thread, add message, and run agent (same as before)
+        # Steps 1-3 are unchanged
         thread = project_client.agents.create_thread()
         print(f"\n📝 Created thread, ID: {thread.id} for question: '{question}'")
 
@@ -152,22 +157,16 @@ def run_agent_query(project_client, agent, question: str):
                         
                         print(text_value)
                         
-                        # --- KEY CHANGE: Manually convert objects to dictionaries for printing ---
                         if annotations:
                             print("\n🔍 Raw Annotation Objects (for inspection):")
                             for i, annotation in enumerate(annotations):
                                 print(f"--- Annotation [{i+1}] ---")
                                 
-                                # Convert the main annotation object to a dict
-                                annotation_dict = vars(annotation).copy()
-
-                                # Check for nested objects and convert them to dicts as well
-                                for key, value in annotation_dict.items():
-                                    if hasattr(value, '__dict__'): # Check if it's a custom object
-                                        annotation_dict[key] = vars(value)
-
-                                # Now, print the fully converted dictionary as clean JSON
-                                print(json.dumps(annotation_dict, indent=2))
+                                # --- THIS IS THE KEY CHANGE ---
+                                # We pass the original annotation object directly to json.dumps
+                                # and provide our custom serializer via the 'default' parameter.
+                                print(json.dumps(annotation, indent=2, default=sdk_object_serializer))
+                                # ------------------------------
                         else:
                             print("\n- No annotations provided for this response.")
 
