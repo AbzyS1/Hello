@@ -109,25 +109,24 @@ def create_agent_with_tool(project_client, model_deployment_name, ai_search_tool
 
 def run_agent_query(project_client, agent, question: str):
     """
-    Runs a query and prints the raw, complete annotation objects for inspection.
+    Runs a query and prints the raw, complete annotation objects for inspection by
+    manually converting them to dictionaries.
     """
     if not project_client or not agent:
         print("× Cannot run agent query: Client or agent not initialized.")
         return
 
     try:
-        # Step 1: Create a new conversation thread
+        # Step 1-3: Create thread, add message, and run agent (same as before)
         thread = project_client.agents.create_thread()
         print(f"\n📝 Created thread, ID: {thread.id} for question: '{question}'")
 
-        # Step 2: Add the user's question to the thread
         project_client.agents.create_message(
             thread_id=thread.id,
             role="user",
             content=question
         )
 
-        # Step 3: Create and process the run
         run = project_client.agents.create_and_process_run(
             thread_id=thread.id,
             agent_id=agent.id
@@ -151,23 +150,29 @@ def run_agent_query(project_client, agent, question: str):
                         text_value = content_block.text.value
                         annotations = content_block.text.annotations
                         
-                        # Print the main text response from the assistant
                         print(text_value)
                         
-                        # --- KEY CHANGE: Inspect raw annotations ---
+                        # --- KEY CHANGE: Manually convert objects to dictionaries for printing ---
                         if annotations:
                             print("\n🔍 Raw Annotation Objects (for inspection):")
                             for i, annotation in enumerate(annotations):
                                 print(f"--- Annotation [{i+1}] ---")
-                                # The annotation object has a 'model_dump' method to serialize it
-                                # to a dictionary, which we can then print as a clean JSON string.
-                                annotation_dict = annotation.model_dump()
+                                
+                                # Convert the main annotation object to a dict
+                                annotation_dict = vars(annotation).copy()
+
+                                # Check for nested objects and convert them to dicts as well
+                                for key, value in annotation_dict.items():
+                                    if hasattr(value, '__dict__'): # Check if it's a custom object
+                                        annotation_dict[key] = vars(value)
+
+                                # Now, print the fully converted dictionary as clean JSON
                                 print(json.dumps(annotation_dict, indent=2))
                         else:
                             print("\n- No annotations provided for this response.")
 
                 assistant_responded = True
-                break # We found the latest assistant message, so we can stop
+                break
        
         if not assistant_responded:
             print("   - No response from assistant found in the thread.")
