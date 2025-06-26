@@ -1,7 +1,15 @@
 import asyncio
 import sys
+import os
+from typing import Annotated
+from dotenv import load_dotenv
 
+load_dotenv('.env')
+import sys
 from azure.identity.aio import ClientSecretCredential
+from azure.search.documents.aio import SearchClient
+from azure.search.documents.indexes.aio import SearchIndexClient
+from azure.core.credentials import AzureKeyCredential
 
 from semantic_kernel.agents import Agent, AzureAIAgent, AzureAIAgentSettings, ChatCompletionAgent, GroupChatOrchestration
 from semantic_kernel.agents.orchestration.group_chat import BooleanResult, GroupChatManager, MessageResult, StringResult
@@ -11,6 +19,7 @@ from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion
 from semantic_kernel.connectors.ai.prompt_execution_settings import PromptExecutionSettings
 from semantic_kernel.contents import AuthorRole, ChatHistory, ChatMessageContent
 from semantic_kernel.functions import KernelArguments
+from semantic_kernel.functions.kernel_function_decorator import kernel_function
 from semantic_kernel.kernel import Kernel
 from semantic_kernel.prompt_template import KernelPromptTemplate, PromptTemplateConfig
 
@@ -18,7 +27,6 @@ if sys.version_info >= (3, 12):
     from typing import override  # pragma: no cover
 else:
     from typing_extensions import override  # pragma: no cover
-
 
 """
 The following sample demonstrates how to create a group chat orchestration with a
@@ -30,25 +38,124 @@ them in a group chat to discuss a topic. The group chat manager is responsible f
 controlling the flow of the conversation, selecting the next agent to speak, and
 filtering the results of the conversation, which is a summary of the discussion.
 
-This updated version includes an Azure AI agent that can be enhanced with Azure AI Search
-capabilities to provide information from indexed data sources. To enable Azure AI Search:
-
-1. Set up Azure AI Search service and create an index
-2. Configure your Azure AI project with the search connection
-3. Uncomment and modify the Azure AI Search tool configuration in the get_agents() function
-
-For a complete Azure AI Search integration example, see:
-python/samples/concepts/agents/azure_ai_agent/azure_ai_agent_azure_ai_search.py
+Additionally, this sample includes an Azure AI Search plugin that provides search
+functionality to one of the agents.
 """
 
+class AzureAISearchPlugin:
+    """A plugin that provides Azure AI Search functionality."""
+    
+    def __init__(
+        self,
+        search_endpoint: str | None = None,
+        api_key: str | None = None,
+        index_name: str | None = None,
+        env_file_path: str | None = None
+    ):
+        """Initialize the Azure AI Search plugin.
+        
+        Args:
+            search_endpoint: Azure AI Search service endpoint
+            api_key: Azure AI Search API key
+            index_name: Name of the search index
+            env_file_path: Path to environment file
+        """
+        # Get values from parameters or environment variables
+        endpoint_val = search_endpoint or os.getenv("AZURE_AI_SEARCH_ENDPOINT")
+        api_key_val = api_key or os.getenv("AZURE_AI_SEARCH_API_KEY")
+        index_name_val = index_name or os.getenv("AZURE_AI_SEARCH_INDEX_NAME", "default-index")
+        
+        if not endpoint_val:
+            raise ValueError("Azure AI Search endpoint is required")
+        if not api_key_val:
+            raise ValueError("Azure AI Search API key is required")
+        if not index_name_val:
+            raise ValueError("Azure AI Search index name is required")
+        
+        # Store configuration
+        self.endpoint = endpoint_val
+        self.api_key = api_key_val
+        self.index_name = index_name_val
+        
+        # Initialize Azure AI Search client
+        credential = AzureKeyCredential(api_key_val)
+            
+        self.search_client = SearchClient(
+            endpoint=endpoint_val,
+            index_name=index_name_val,
+            credential=credential
+        )
+    
+    @kernel_function(
+        name="search_knowledge_base",
+        description="Search the Azure AI Search knowledge base for relevant information"
+    )
+    async def search_knowledge_base(
+        self,
+        query: Annotated[str, "The search query to find relevant information"],
+        top_k: Annotated[int, "The number of top results to return"] = 5
+    ) -> Annotated[str, "The search results formatted as a string"]:
+        """Search the Azure AI Search knowledge base and return formatted results."""
+        try:
+            # Perform the search
+            results = await self.search_client.search(
+                search_text=query,
+                top=top_k,
+                include_total_count=True
+            )
+            
+            # Format results
+            formatted_results = []
+            async for result in results:
+                # Extract relevant fields (adjust based on your index schema)
+                content = result.get("content", result.get("text", str(result)))
+                score = result.get("@search.score", "N/A")
+                formatted_results.append(f"Score: {score} - {content}")
+            
+            if not formatted_results:
+                return "No relevant information found in the knowledge base."
+            
+            return "Knowledge Base Search Results:\n" + "\n\n".join(formatted_results)
+            
+        except Exception as e:
+            return f"Error searching knowledge base: {str(e)}"
+    
+    @kernel_function(
+        name="get_search_suggestions",
+        description="Get search suggestions based on a partial query"
+    )
+    async def get_search_suggestions(
+        self,
+        partial_query: Annotated[str, "The partial search query"],
+        suggestion_count: Annotated[int, "Number of suggestions to return"] = 3
+    ) -> Annotated[str, "Search suggestions formatted as a string"]:
+        """Get search suggestions for a partial query."""
+        try:
+            # Use the suggester API if available, or fallback to basic search
+            results = await self.search_client.search(
+                search_text=partial_query + "*",
+                top=suggestion_count
+            )
+            
+            suggestions = []
+            async for result in results:
+                # Extract title or first few words as suggestion
+                title = result.get("title", result.get("content", str(result))[:50])
+                suggestions.append(title)
+            
+            if not suggestions:
+                return "No suggestions available for this query."
+            
+            return "Search Suggestions:\n" + "\n".join(f"- {suggestion}" for suggestion in suggestions)
+            
+        except Exception as e:
+            return f"Error getting suggestions: {str(e)}"
 
 async def get_agents() -> list[Agent]:
     """Return a list of agents that will participate in the group style discussion.
 
-    This includes both ChatCompletion agents and an Azure AI Search agent.
     Feel free to add or remove agents.
     """
-    # Regular ChatCompletion agents
     farmer = ChatCompletionAgent(
         name="Farmer",
         description="A rural farmer from Southeast Asia.",
@@ -58,7 +165,7 @@ async def get_agents() -> list[Agent]:
             "You value tradition and sustainability. "
             "You are in a debate. Feel free to challenge the other participants with respect."
         ),
-        service=AzureChatCompletion(),
+        service=AzureChatCompletion(env_file_path=".env"),
     )
     developer = ChatCompletionAgent(
         name="Developer",
@@ -69,7 +176,7 @@ async def get_agents() -> list[Agent]:
             "You value innovation, freedom, and work-life balance. "
             "You are in a debate. Feel free to challenge the other participants with respect."
         ),
-        service=AzureChatCompletion(),
+        service=AzureChatCompletion(env_file_path=".env"),
     )
     teacher = ChatCompletionAgent(
         name="Teacher",
@@ -80,7 +187,7 @@ async def get_agents() -> list[Agent]:
             "You value legacy, learning, and cultural continuity. "
             "You are in a debate. Feel free to challenge the other participants with respect."
         ),
-        service=AzureChatCompletion(),
+        service=AzureChatCompletion(env_file_path=".env"),
     )
     activist = ChatCompletionAgent(
         name="Activist",
@@ -90,7 +197,7 @@ async def get_agents() -> list[Agent]:
             "You focus on social justice, environmental rights, and generational change. "
             "You are in a debate. Feel free to challenge the other participants with respect."
         ),
-        service=AzureChatCompletion(),
+        service=AzureChatCompletion(env_file_path=".env"),
     )
     spiritual_leader = ChatCompletionAgent(
         name="SpiritualLeader",
@@ -100,7 +207,7 @@ async def get_agents() -> list[Agent]:
             "You provide insights grounded in religion, morality, and community service. "
             "You are in a debate. Feel free to challenge the other participants with respect."
         ),
-        service=AzureChatCompletion(),
+        service=AzureChatCompletion(env_file_path=".env"),
     )
     artist = ChatCompletionAgent(
         name="Artist",
@@ -110,7 +217,7 @@ async def get_agents() -> list[Agent]:
             "You view life through creative expression, storytelling, and collective memory. "
             "You are in a debate. Feel free to challenge the other participants with respect."
         ),
-        service=AzureChatCompletion(),
+        service=AzureChatCompletion(env_file_path=".env"),
     )
     immigrant = ChatCompletionAgent(
         name="Immigrant",
@@ -121,78 +228,48 @@ async def get_agents() -> list[Agent]:
             "You focus on family success, risk, and opportunity. "
             "You are in a debate. Feel free to challenge the other participants with respect."
         ),
-        service=AzureChatCompletion(),
+        service=AzureChatCompletion(env_file_path=".env"),
     )
-    doctor = ChatCompletionAgent(
-        name="Doctor",
-        description="A doctor from Scandinavia.",
+    taxi_driver = ChatCompletionAgent(
+        name="TaxiDriver",
+        description="A Taxi Driver from the UK.",
         instructions=(
-            "You're a doctor from Scandinavia. "
-            "Your perspective is shaped by public health, equity, and structured societal support. "
+            "You're a taxi driver from London. "
+            "Your perspective is shaped by your interactions with people from around the globe "
             "You are in a debate. Feel free to challenge the other participants with respect."
         ),
-        service=AzureChatCompletion(),
+        service=AzureChatCompletion(env_file_path=".env"),
     )
-
-    # Create Azure AI agent (with potential for search capabilities)
+    
+    # Create Azure AI Search plugin
     try:
-        async with (
-            ClientSecretCredential(tenant_id="", client_id="", client_secret="") as creds,
-            AzureAIAgent.create_client(credential=creds) as client,
-        ):
-            # Create agent definition without Azure AI Search tool for simplicity
-            # To enable Azure AI Search, uncomment and configure the following:
-            #
-            from azure.ai.projects.models import AzureAISearchTool, ConnectionType
-            # 
-            # # Find Azure AI Search connection
-            ai_search_conn_id = ""
-            conn_list = client.connections.list()
-            async for conn in conn_list:
-                if conn.connection_type == ConnectionType.AZURE_AI_SEARCH:
-                    ai_search_conn_id = conn.id
-                    break
-            # 
-            # # Create Azure AI Search tool
-            ai_search = AzureAISearchTool(
-                index_connection_id=ai_search_conn_id,
-                index_name="your-search-index-name"
-            )
-            # 
-            # # Then add to agent creation:
-            # tools=ai_search.definitions,
-            # tool_resources=ai_search.resources,
-            
-            agent_definition = await client.agents.create_agent(
-                model="gpt-4o-mini",  # Using a default model
-                name="KnowledgeExpert",
-                description="An expert who provides factual information and evidence-based insights.",
-                instructions=(
-                    "You're a knowledgeable expert who provides factual information and "
-                    "evidence-based insights to support the discussion. "
-                    "You value accuracy, evidence, and well-researched information. "
-                    "You are in a debate. Feel free to challenge the other participants with respect "
-                    "and back up your points with factual information when appropriate. "
-                    "When Azure AI Search is configured, use it to find relevant information."
-                ),
-                tools=ai_search.definitions,
-                tool_resources=ai_search.resources,
-            )
-
-            # Create the AzureAI Agent
-            knowledge_expert = AzureAIAgent(
-                client=client,
-                definition=agent_definition,
-            )
-
-            return [farmer, developer, teacher, activist, spiritual_leader, artist, immigrant, doctor, knowledge_expert]
-
+        search_plugin = AzureAISearchPlugin()
+        
+        # Create a knowledge researcher agent with Azure AI Search capabilities
+        researcher = ChatCompletionAgent(
+            name="Researcher",
+            description="A research analyst with access to comprehensive knowledge databases.",
+            instructions=(
+                "You're a research analyst with access to comprehensive knowledge databases. "
+                "You can search for factual information, historical data, and expert analysis to support discussions. "
+                "When relevant to the debate topic, use your search capabilities to find authoritative information. "
+                "You value evidence-based arguments and factual accuracy. "
+                "You are in a debate. Feel free to challenge the other participants with respect and provide factual backing for your points."
+            ),
+            service=AzureChatCompletion(env_file_path=".env"),
+            # Add the search plugin to the kernel
+            kernel=Kernel(),
+        )
+        
+        # Add the search plugin to the researcher's kernel
+        researcher.kernel.add_plugin(search_plugin, plugin_name="AzureSearch")
+        
+        return [farmer, developer, teacher, activist, spiritual_leader, artist, immigrant, taxi_driver, researcher]
+        
     except Exception as e:
-        print(f"Warning: Could not create Azure AI agent: {e}")
-        print("Continuing with ChatCompletion agents only...")
-        # Return just the ChatCompletion agents if Azure AI agent creation fails
-        return [farmer, developer, teacher, activist, spiritual_leader, artist, immigrant, doctor]
-
+        print(f"Warning: Could not initialize Azure AI Search plugin: {e}")
+        print("Continuing without the researcher agent...")
+        return [farmer, developer, teacher, activist, spiritual_leader, artist, immigrant, taxi_driver]
 
 class ChatCompletionGroupChatManager(GroupChatManager):
     """A simple chat completion base group chat manager.
@@ -226,7 +303,9 @@ class ChatCompletionGroupChatManager(GroupChatManager):
 
     def __init__(self, topic: str, service: ChatCompletionClientBase, **kwargs) -> None:
         """Initialize the group chat manager."""
-        super().__init__(topic=topic, service=service, **kwargs)
+        super().__init__(**kwargs)
+        self.topic = topic
+        self.service = service
 
     async def _render_prompt(self, prompt: str, arguments: KernelArguments) -> str:
         """Helper to render a prompt with arguments."""
@@ -275,7 +354,7 @@ class ChatCompletionGroupChatManager(GroupChatManager):
             settings=PromptExecutionSettings(response_format=BooleanResult),
         )
 
-        termination_with_reason = BooleanResult.model_validate_json(response.content)
+        termination_with_reason = BooleanResult.model_validate_json(response.content or "{}")
 
         print("*********************")
         print(f"Should terminate: {termination_with_reason.result}\nReason: {termination_with_reason.reason}.")
@@ -316,7 +395,7 @@ class ChatCompletionGroupChatManager(GroupChatManager):
             settings=PromptExecutionSettings(response_format=StringResult),
         )
 
-        participant_name_with_reason = StringResult.model_validate_json(response.content)
+        participant_name_with_reason = StringResult.model_validate_json(response.content or "{}")
 
         print("*********************")
         print(
@@ -359,18 +438,20 @@ class ChatCompletionGroupChatManager(GroupChatManager):
             chat_history,
             settings=PromptExecutionSettings(response_format=StringResult),
         )
-        string_with_reason = StringResult.model_validate_json(response.content)
+        string_with_reason = StringResult.model_validate_json(response.content or "{}")
 
         return MessageResult(
             result=ChatMessageContent(role=AuthorRole.ASSISTANT, content=string_with_reason.result),
             reason=string_with_reason.reason,
         )
 
-
-def agent_response_callback(message: ChatMessageContent) -> None:
+async def agent_response_callback(messages) -> None:
     """Callback function to retrieve agent responses."""
-    print(f"**{message.name}**\n{message.content}")
-
+    if isinstance(messages, list):
+        for message in messages:
+            print(f"**{message.name}**\n{message.content}")
+    else:
+        print(f"**{messages.name}**\n{messages.content}")
 
 async def main():
     """Main function to run the agents."""
@@ -379,7 +460,7 @@ async def main():
     group_chat_orchestration = GroupChatOrchestration(
         members=agents,
         manager=ChatCompletionGroupChatManager(
-            topic="What does a good life mean to you personally?",
+            topic="How should your government approach taxation?",
             service=AzureChatCompletion(),
             max_rounds=10,
         ),
@@ -390,33 +471,18 @@ async def main():
     runtime = InProcessRuntime()
     runtime.start()
 
-    try:
-        # 3. Invoke the orchestration with a task and the runtime
-        orchestration_result = await group_chat_orchestration.invoke(
-            task="Please start the discussion.",
-            runtime=runtime,
-        )
+    # 3. Invoke the orchestration with a task and the runtime
+    orchestration_result = await group_chat_orchestration.invoke(
+        task="Please start the discussion.",
+        runtime=runtime,
+    )
 
-        # 4. Wait for the results
-        value = await orchestration_result.get()
-        print(value)
+    # 4. Wait for the results
+    value = await orchestration_result.get()
+    print(value)
 
-    finally:
-        # 5. Clean up Azure AI agents if any exist
-        for agent in agents:
-            if isinstance(agent, AzureAIAgent):
-                try:
-                    async with (
-                        DefaultAzureCredential() as creds,
-                        AzureAIAgent.create_client(credential=creds) as client,
-                    ):
-                        await client.agents.delete_agent(agent.definition.id)
-                        print(f"Cleaned up Azure AI agent: {agent.name}")
-                except Exception as e:
-                    print(f"Warning: Could not clean up Azure AI agent {agent.name}: {e}")
-
-        # 6. Stop the runtime after the invocation is complete
-        await runtime.stop_when_idle()
+    # 5. Stop the runtime after the invocation is complete
+    await runtime.stop_when_idle()
 
     """
     Sample output:
@@ -456,7 +522,6 @@ async def main():
     *********************
     Our discussion on what constitutes a good life revolved around key perspectives from a farmer, a developer, and a...
     """
-
 
 if __name__ == "__main__":
     asyncio.run(main())
